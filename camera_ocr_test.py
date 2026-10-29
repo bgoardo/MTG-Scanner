@@ -6,8 +6,13 @@ Controls (click the preview window first):
   SPACE  run OCR on the box, then look the name up on Scryfall
          (with no box set, OCRs the whole frame and skips the lookup)
   f      run OCR on the whole frame (no Scryfall lookup)
+  a      add the matched card to your collection (Shift+A adds it as foil)
+  e      download your collection as plain text to collection.txt
   s      save the current frame and the last OCR crop to ./captures
   q/ESC  quit
+
+Collection (optional): start collection_server.py, then run this script with
+  --username NAME   (add --register the first time to create the account)
 
 Setup:
   pip install opencv-python pytesseract numpy requests
@@ -17,6 +22,7 @@ Setup:
     Linux:   sudo apt install tesseract-ocr
 """
 import argparse
+import getpass
 import os
 import re
 import time
@@ -33,14 +39,11 @@ def sharpness(gray):
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 
-def preprocess(img, target_h=80):
+def preprocess(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    scale = target_h / gray.shape[0]
-    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
-    gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=interp)
+    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
     _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    # Tesseract does better with a margin around the text
-    return cv2.copyMakeBorder(bw, 15, 15, 15, 15, cv2.BORDER_CONSTANT, value=255)
+    return bw
 
 
 def run_ocr(img, psm):
@@ -118,6 +121,42 @@ def ascii_only(text):
     return text.encode("ascii", "ignore").decode()
 
 
+# ------------------------------------------------------- collection server
+def api_login(server, username, password, register=False):
+    path = "/register" if register else "/login"
+    r = requests.post(f"{server}{path}",
+                      json={"username": username, "password": password}, timeout=10)
+    if r.status_code != 200:
+        raise SystemExit(f"{path} failed: {r.json().get('detail', r.text)}")
+    return r.json()["token"]
+
+
+def api_add_card(server, token, card, foil):
+    payload = {
+        "scryfall_id": card["id"],
+        "name": card["name"],
+        "set_code": card["set"],
+        "collector_number": card["collector_number"],
+        "foil": foil,
+        "quantity": 1,
+    }
+    r = requests.post(f"{server}/cards", json=payload, timeout=10,
+                      headers={"Authorization": f"Bearer {token}"})
+    if r.status_code != 200:
+        try:
+            return False, r.json().get("detail", r.text)
+        except ValueError:
+            return False, f"server error {r.status_code}"
+    return True, f"{'Foil ' if foil else ''}{r.json()['name']}: now x{r.json()['quantity']}"
+
+
+def api_export_text(server, token):
+    r = requests.get(f"{server}/collection.txt", timeout=10,
+                     headers={"Authorization": f"Bearer {token}"})
+    r.raise_for_status()
+    return r.text
+
+
 def open_camera(index, width, height, no_dshow):
     if os.name == "nt" and not no_dshow:
         cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
@@ -131,16 +170,28 @@ def open_camera(index, width, height, no_dshow):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--camera", type=int, default=0, help="camera index")
-    ap.add_argument("--width", type=int, default=1600)
-    ap.add_argument("--height", type=int, default=1200)
+    ap.add_argument("--width", type=int, default=1920)
+    ap.add_argument("--height", type=int, default=1080)
     ap.add_argument("--no-dshow", action="store_true", help="skip DirectShow on Windows")
     ap.add_argument("--tesseract-cmd", help=r"e.g. C:\Program Files\Tesseract-OCR\tesseract.exe")
+    ap.add_argument("--server", default="http://127.0.0.1:8000", help="collection server URL")
+    ap.add_argument("--username", help="log in to the collection server as this user")
+    ap.add_argument("--register", action="store_true", help="create the account first")
     ap.add_argument("--no-lookup", action="store_true", help="OCR only, skip Scryfall")
     ap.add_argument("--no-autofocus", action="store_true", help="try to disable autofocus")
     args = ap.parse_args()
 
     if args.tesseract_cmd:
         pytesseract.pytesseract.tesseract_cmd = args.tesseract_cmd
+
+    token = None
+    if args.username:
+        password = getpass.getpass(f"Password for {args.username}: ")
+        try:
+            token = api_login(args.server, args.username, password, args.register)
+        except requests.RequestException as e:
+            raise SystemExit(f"Could not reach {args.server}: {e}")
+        print(f"Logged in as {args.username}")
 
     cap = open_camera(args.camera, args.width, args.height, args.no_dshow)
     if not cap.isOpened():
@@ -156,6 +207,7 @@ def main():
     roi = None            # (x, y, w, h)
     last_text, last_conf = "", 0.0
     card_line, card_ok = "", False
+    last_card, status = None, ""
     last_crop = None
     os.makedirs("captures", exist_ok=True)
 
@@ -186,6 +238,10 @@ def main():
             cv2.putText(view, ascii_only(card_line), (10, 110),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
+        if status:
+            cv2.putText(view, ascii_only(status), (10, 150),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 200, 0), 2)
+
         # Scale down big frames so the preview fits on screen
         scale = min(1.0, 1280 / view.shape[1])
         if scale < 1.0:
@@ -215,18 +271,47 @@ def main():
             print(f"[{time.time() - t0:.2f}s] '{last_text}'  confidence {last_conf:.0f}%")
             cv2.imshow("What OCR saw", bw)
 
-            card_line, card_ok = "", False
+            card_line, card_ok, last_card, status = "", False, None, ""
             if is_title and not args.no_lookup:
                 res = scryfall_lookup(last_text)
                 if res["status"] == "ok":
                     card = res["card"]
                     card_line, card_ok = describe_card(card), True
+                    last_card = card
                     print(f"  Scryfall: {card_line}")
                     print(f"  (searched for '{res['query']}', "
                           f"{card.get('type_line', '')}, {card['set_name']})")
                 else:
                     card_line = f"No match: {res['message']}"[:70]
                     print(f"  Scryfall {res['status']}: {res['message']}")
+
+        elif key in (ord("a"), ord("A")):
+            if not token:
+                status = "Not logged in (use --username)"
+            elif not last_card:
+                status = "Scan a card first (SPACE)"
+            else:
+                try:
+                    ok, msg = api_add_card(args.server, token, last_card, foil=(key == ord("A")))
+                    status = ("Added " if ok else "Failed: ") + msg
+                except requests.RequestException as e:
+                    status = "Server unreachable"
+                    print(e)
+            print(status)
+
+        elif key == ord("e"):
+            if not token:
+                status = "Not logged in (use --username)"
+            else:
+                try:
+                    text = api_export_text(args.server, token)
+                    with open("collection.txt", "w", encoding="utf-8") as f:
+                        f.write(text)
+                    status = f"Saved collection.txt ({len(text.splitlines())} lines)"
+                    print(text)
+                except requests.RequestException as e:
+                    status = "Export failed"
+                    print(e)
 
         elif key == ord("s"):
             stamp = time.strftime("%Y%m%d_%H%M%S")
